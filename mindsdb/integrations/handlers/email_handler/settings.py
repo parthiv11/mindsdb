@@ -45,6 +45,7 @@ class EmailConnectionDetails(BaseModel):
     imap_server: str = "imap.gmail.com"
     smtp_server: str = "smtp.gmail.com"
     smtp_port: int = 587
+    oauth_token : int = 587
 
     class Config:
         json_schema_extra = {
@@ -53,7 +54,8 @@ class EmailConnectionDetails(BaseModel):
                 "password": "password",
                 "imap_server": "imap.gmail.com",
                 "smtp_server": "smtp.gmail.com",
-                "smtp_port": 587
+                "smtp_port": 587,
+                "oauth_token": "ooaatth...",
             }
         }
         extra = "forbid"
