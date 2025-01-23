@@ -21,6 +21,14 @@ from mindsdb.utilities.context import context as ctx
 logger = log.getLogger(__name__)
 
 
+def execute_queries(query, execute_function):
+    queries = query.split(';')
+    for q in queries:
+        q = q.strip()
+        if q:
+            execute_function(q)
+
+
 @ns_conf.route("/query")
 @ns_conf.param("query", "Execute query")
 class Query(Resource):
@@ -56,20 +64,25 @@ class Query(Resource):
             mysql_proxy = FakeMysqlProxy()
             mysql_proxy.set_context(context)
             try:
-                result = mysql_proxy.process_query(query)
+                def execute_function(q):
+                    nonlocal query_response
+                    result = mysql_proxy.process_query(q)
 
-                if result.type == SQL_RESPONSE_TYPE.OK:
-                    query_response = {"type": SQL_RESPONSE_TYPE.OK}
-                elif result.type == SQL_RESPONSE_TYPE.TABLE:
-                    data = result.data.to_lists(json_types=True)
-                    query_response = {
-                        "type": SQL_RESPONSE_TYPE.TABLE,
-                        "data": data,
-                        "column_names": [
-                            x["alias"] or x["name"] if "alias" in x else x["name"]
-                            for x in result.columns
-                        ],
-                    }
+                    if result.type == SQL_RESPONSE_TYPE.OK:
+                        query_response = {"type": SQL_RESPONSE_TYPE.OK}
+                    elif result.type == SQL_RESPONSE_TYPE.TABLE:
+                        data = result.data.to_lists(json_types=True)
+                        query_response = {
+                            "type": SQL_RESPONSE_TYPE.TABLE,
+                            "data": data,
+                            "column_names": [
+                                x["alias"] or x["name"] if "alias" in x else x["name"]
+                                for x in result.columns
+                            ],
+                        }
+
+                execute_queries(query, execute_function)
+
             except ExecutorException as e:
                 # classified error
                 error_type = "expected"
