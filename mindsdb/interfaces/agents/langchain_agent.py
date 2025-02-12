@@ -2,7 +2,9 @@ import json
 from concurrent.futures import as_completed, TimeoutError
 from typing import Dict, Iterable, List, Optional
 from uuid import uuid4
+import queue
 import re
+import threading
 import numpy as np
 import pandas as pd
 
@@ -14,6 +16,7 @@ from langchain_community.chat_models import (
     ChatLiteLLM,
     ChatOllama)
 from langchain_core.agents import AgentAction, AgentStep
+from langchain_core.callbacks.base import BaseCallbackHandler
 
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain_core.messages.base import BaseMessage
@@ -26,6 +29,8 @@ from mindsdb.integrations.handlers.openai_handler.constants import (
 from mindsdb.integrations.libs.llm.utils import get_llm_config
 from mindsdb.integrations.utilities.handler_utils import get_api_key
 from mindsdb.integrations.utilities.rag.settings import DEFAULT_RAG_PROMPT_TEMPLATE
+from mindsdb.interfaces.agents.event_dispatch_callback_handler import EventDispatchCallbackHandler
+from mindsdb.interfaces.agents.constants import AGENT_CHUNK_POLLING_INTERVAL_SECONDS
 from mindsdb.utilities import log
 from mindsdb.utilities.context_executor import ContextThreadPoolExecutor
 from mindsdb.interfaces.storage import db
@@ -49,7 +54,7 @@ from .constants import (
     NVIDIA_NIM_CHAT_MODELS,
     USER_COLUMN,
     ASSISTANT_COLUMN,
-    CONTEXT_COLUMN
+    CONTEXT_COLUMN, TRACE_ID_COLUMN
 )
 from mindsdb.interfaces.skills.skill_tool import skill_tool, SkillData
 from langchain_anthropic import ChatAnthropic
@@ -371,9 +376,9 @@ class LangchainAgent:
         for row in df[:-1].to_dict("records"):
             question = row[user_column]
             answer = row[assistant_column]
-            if question:
+            if isinstance(question, str) and len(question) > 0:
                 memory.chat_memory.add_user_message(question)
-            if answer:
+            if isinstance(answer, str) and len(answer) > 0:
                 memory.chat_memory.add_ai_message(answer)
 
         agent_type = args.get("agent_type", DEFAULT_AGENT_TYPE)
@@ -455,9 +460,7 @@ class LangchainAgent:
 
         # custom tracer
         if self.mdb_langfuse_callback_handler is None:
-            trace_id = None
-            if self.langfuse_client_wrapper.trace is not None:
-                trace_id = args.get("trace_id", self.langfuse_client_wrapper.trace.id)
+            trace_id = self.langfuse_client_wrapper.get_trace_id()
 
             span_id = None
             if self.run_completion_span is not None:
@@ -562,6 +565,7 @@ AI: {response}"""
                 CONTEXT_COLUMN: [
                     json.dumps(ctx) for ctx in contexts
                 ],  # Serialize context to JSON string
+                TRACE_ID_COLUMN: self.langfuse_client_wrapper.get_trace_id()
             }
         )
 
@@ -569,6 +573,45 @@ AI: {response}"""
             pred_df = pred_df.drop(columns=[CONTEXT_COLUMN])
 
         return pred_df
+
+    def add_chunk_metadata(self, chunk: Dict) -> Dict:
+        logger.debug(f'Adding metadata to chunk: {chunk}')
+        logger.debug(f'Trace ID: {self.langfuse_client_wrapper.get_trace_id()}')
+        chunk["trace_id"] = self.langfuse_client_wrapper.get_trace_id()
+        return chunk
+
+    def _stream_agent_executor(self, agent_executor: AgentExecutor, prompt: str, callbacks: List[BaseCallbackHandler]):
+        chunk_queue = queue.Queue()
+        # Add event dispatch callback handler only to streaming completions.
+        event_dispatch_callback_handler = EventDispatchCallbackHandler(chunk_queue)
+        callbacks.append(event_dispatch_callback_handler)
+        stream_iterator = agent_executor.stream(prompt, config={'callbacks': callbacks})
+
+        agent_executor_finished_event = threading.Event()
+
+        def stream_worker(context: dict):
+            try:
+                ctx.load(context)
+                for chunk in stream_iterator:
+                    chunk_queue.put(chunk)
+            finally:
+                # Wrap in try/finally to always set the thread event even if there's an exception.
+                agent_executor_finished_event.set()
+
+        # Enqueue Langchain agent streaming chunks in a separate thread to not block event chunks.
+        executor_stream_thread = threading.Thread(target=stream_worker, daemon=True, args=(ctx.dump(),))
+        executor_stream_thread.start()
+
+        while not agent_executor_finished_event.is_set():
+            try:
+                chunk = chunk_queue.get(block=True, timeout=AGENT_CHUNK_POLLING_INTERVAL_SECONDS)
+            except queue.Empty:
+                continue
+            logger.debug(f'Processing streaming chunk {chunk}')
+            processed_chunk = self.process_chunk(chunk)
+            logger.info(f'Processed chunk: {processed_chunk}')
+            yield self.add_chunk_metadata(processed_chunk)
+            chunk_queue.task_done()
 
     def stream_agent(self, df: pd.DataFrame, agent_executor: AgentExecutor, args: Dict) -> Iterable[Dict]:
         base_template = args.get('prompt_template', args['prompt_template'])
@@ -579,22 +622,14 @@ AI: {response}"""
 
         callbacks, context_callback = prepare_callbacks(self, args)
 
-        yield {"type": "start", "prompt": prompts[0]}
+        yield self.add_chunk_metadata({"type": "start", "prompt": prompts[0]})
 
         if not hasattr(agent_executor, 'stream') or not callable(agent_executor.stream):
             raise AttributeError("The agent_executor does not have a 'stream' method")
 
-        stream_iterator = agent_executor.stream(prompts[0],
-                                                config={'callbacks': callbacks})
-
-        if not hasattr(stream_iterator, '__iter__'):
-            raise TypeError("The stream method did not return an iterable")
-
+        stream_iterator = self._stream_agent_executor(agent_executor, prompts[0], callbacks)
         for chunk in stream_iterator:
-            logger.info(f'Processing streaming chunk {chunk}')
-            processed_chunk = self.process_chunk(chunk)
-            logger.info(f'Processed chunk: {processed_chunk}')
-            yield processed_chunk
+            yield chunk
 
         if return_context:
             # Yield context if required
@@ -604,7 +639,7 @@ AI: {response}"""
 
         if self.log_callback_handler.generated_sql:
             # Yield generated SQL if available
-            yield {"type": "sql", "content": self.log_callback_handler.generated_sql}
+            yield self.add_chunk_metadata({"type": "sql", "content": self.log_callback_handler.generated_sql})
 
         # End the run completion span and update the metadata with tool usage
         self.langfuse_client_wrapper.end_span_stream(span=self.run_completion_span)
