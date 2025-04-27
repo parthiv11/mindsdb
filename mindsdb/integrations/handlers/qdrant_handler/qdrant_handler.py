@@ -33,7 +33,9 @@ class QdrantHandler(VectorStoreHandler):
         # We are requiring the user to pass these options in the connection_data
         # These options are documented here. https://qdrant.github.io/qdrant/redoc/index.html#tag/collections/operation/create_collection
         self.collection_config = connection_data.pop("collection_config")
-        self.connect(**connection_data)
+        # self.connect(**connection_data)
+        self._client = QdrantClient(**connection_data)
+
 
     def connect(self, **kwargs):
         """Connect to a Qdrant instance.
@@ -43,7 +45,6 @@ class QdrantHandler(VectorStoreHandler):
             return self._client
 
         try:
-            self._client = QdrantClient(**kwargs)
             self.is_connected = True
             return self._client
         except Exception as e:
@@ -52,9 +53,9 @@ class QdrantHandler(VectorStoreHandler):
 
     def disconnect(self):
         """Close the database connection."""
-        if self.is_connected:
-            self._client.close()
-            self._client = None
+        # if self.is_connected:
+        #     self._client.close()
+        #     self._client = None
         self.is_connected = False
 
     def check_connection(self) -> StatusResponse:

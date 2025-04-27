@@ -77,8 +77,9 @@ class VectorStoreHandler(BaseHandler):
         return NotImplementedError()
 
     def __del__(self):
-        if self.is_connected is True:
-            self.disconnect()
+        # if self.is_connected is True:
+        #     self.disconnect()
+        pass
 
     def disconnect(self):
         pass
