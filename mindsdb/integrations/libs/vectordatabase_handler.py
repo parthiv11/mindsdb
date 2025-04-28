@@ -34,7 +34,7 @@ class TableField(Enum):
     """
 
     ID = "id"
-    CONTENT = "content"
+    CONTENT = "chunk_content"
     EMBEDDINGS = "embeddings"
     METADATA = "metadata"
     SEARCH_VECTOR = "search_vector"
