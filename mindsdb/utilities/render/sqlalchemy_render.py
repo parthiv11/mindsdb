@@ -152,7 +152,7 @@ class SqlalchemyRender:
 
             parts2.append(part)
         text = '.'.join(parts2)
-        if identifier.is_outer and self.dialect.name == 'oracle':
+        if getattr(identifier, 'is_outer', False) and self.dialect.name == 'oracle':
             text += '(+)'
         return sa.column(text, is_literal=True)
 

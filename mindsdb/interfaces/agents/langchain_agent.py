@@ -89,6 +89,8 @@ def get_llm_provider(args: Dict) -> str:
         return "nvidia_nim"
     if args["model_name"] in GOOGLE_GEMINI_CHAT_MODELS:
         return "google"
+    else:
+        return 'openai'  # Default to OpenAI if no provider is specified
 
     # For vLLM, require explicit provider specification
     raise ValueError("Invalid model name. Please define a supported llm provider")
