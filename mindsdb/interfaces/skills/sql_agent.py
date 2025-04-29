@@ -12,6 +12,7 @@ from mindsdb_sql_parser.ast import Select, Show, Describe, Explain, Identifier
 from mindsdb.utilities import log
 from mindsdb.utilities.context import context as ctx
 from mindsdb.integrations.utilities.query_traversal import query_traversal
+from mindsdb.integrations.libs.response import INF_SCHEMA_COLUMNS_NAMES
 
 logger = log.getLogger(__name__)
 
@@ -275,9 +276,13 @@ class SQLAgent:
         dn = self._command_executor.session.datahub.get(integration)
 
         fields, dtypes = [], []
-        for column in dn.get_table_columns(table_name, schema_name):
-            fields.append(column['name'])
-            dtypes.append(column.get('type', ''))
+        for df in dn.get_table_columns_df(table_name, schema_name):
+            df_records = df.to_dict(orient='records')
+            fields.append(df_records[INF_SCHEMA_COLUMNS_NAMES.COLUMN_NAME])
+            if df_records[INF_SCHEMA_COLUMNS_NAMES.MYSQL_DATA_TYPE] is not None:
+                dtypes.append(df_records[INF_SCHEMA_COLUMNS_NAMES.MYSQL_DATA_TYPE].value)
+            else:
+                dtypes.append(df_records[INF_SCHEMA_COLUMNS_NAMES.DATA_TYPE])
 
         info = f'Table named `{table_str}`:\n'
         info += f"\nSample with first {self._sample_rows_in_table_info} rows from table {table_str} in CSV format (dialect is 'excel'):\n"
@@ -287,6 +292,7 @@ class SQLAgent:
         return info
 
     def _get_sample_rows(self, table: str, fields: List[str]) -> str:
+        logger.info(f'_get_sample_rows: table={table} fields={fields}')
         command = f"select {', '.join(fields)} from {table} limit {self._sample_rows_in_table_info};"
         try:
             ret = self._call_engine(command)
@@ -300,7 +306,7 @@ class SQLAgent:
                 map(lambda row: [truncate_value(value) for value in row], sample_rows))
             sample_rows_str = "\n" + list_to_csv_str([fields] + sample_rows)
         except Exception as e:
-            logger.warning(e)
+            logger.info(f'_get_sample_rows error: {e}')
             sample_rows_str = "\n" + "\t [error] Couldn't retrieve sample rows!"
 
         return sample_rows_str
@@ -347,14 +353,18 @@ class SQLAgent:
 
     def get_table_info_safe(self, table_names: Optional[List[str]] = None) -> str:
         try:
+            logger.info(f'get_table_info_safe: {table_names}')
             return self.get_table_info(table_names)
         except Exception as e:
+            logger.info(f'get_table_info_safe error: {e}')
             return f"Error: {e}"
 
     def query_safe(self, command: str, fetch: str = "all") -> str:
         try:
+            logger.info(f'query_safe (fetch={fetch}): {command}')
             return self.query(command, fetch)
         except Exception as e:
+            logger.info(f'query_safe error: {e}')
             msg = f"Error: {e}"
             if 'does not exist' in msg and ' relation ' in msg:
                 msg += '\nAvailable tables: ' + ', '.join(self.get_usable_table_names())

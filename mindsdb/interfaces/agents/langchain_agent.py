@@ -15,6 +15,7 @@ from langchain_community.chat_models import (
     ChatAnyscale,
     ChatLiteLLM,
     ChatOllama)
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.agents import AgentAction, AgentStep
 from langchain_core.callbacks.base import BaseCallbackHandler
 
@@ -50,6 +51,7 @@ from .constants import (
     DEFAULT_TIKTOKEN_MODEL_NAME,
     SUPPORTED_PROVIDERS,
     ANTHROPIC_CHAT_MODELS,
+    GOOGLE_GEMINI_CHAT_MODELS,
     OLLAMA_CHAT_MODELS,
     NVIDIA_NIM_CHAT_MODELS,
     USER_COLUMN,
@@ -85,6 +87,8 @@ def get_llm_provider(args: Dict) -> str:
         return "ollama"
     if args["model_name"] in NVIDIA_NIM_CHAT_MODELS:
         return "nvidia_nim"
+    if args["model_name"] in GOOGLE_GEMINI_CHAT_MODELS:
+        return "google"
 
     # For vLLM, require explicit provider specification
     raise ValueError("Invalid model name. Please define a supported llm provider")
@@ -162,6 +166,8 @@ def create_chat_model(args: Dict):
         return ChatOllama(**model_kwargs)
     if args["provider"] == "nvidia_nim":
         return ChatNVIDIA(**model_kwargs)
+    if args["provider"] == "google":
+        return ChatGoogleGenerativeAI(**model_kwargs)
     if args["provider"] == "mindsdb":
         return ChatMindsdb(**model_kwargs)
     raise ValueError(f'Unknown provider: {args["provider"]}')
@@ -400,7 +406,7 @@ class LangchainAgent:
                 "max_iterations", args.get("max_iterations", DEFAULT_MAX_ITERATIONS)
             ),
             memory=memory,
-            verbose=args.get("verbose", args.get("verbose", True)),
+            verbose=args.get("verbose", args.get("verbose", False))
         )
         return agent_executor
 
@@ -435,7 +441,7 @@ class LangchainAgent:
         all_callbacks = []
 
         if self.log_callback_handler is None:
-            self.log_callback_handler = LogCallbackHandler(logger)
+            self.log_callback_handler = LogCallbackHandler(logger, verbose=args.get("verbose", True))
 
         all_callbacks.append(self.log_callback_handler)
 
@@ -599,7 +605,9 @@ AI: {response}"""
                 agent_executor_finished_event.set()
 
         # Enqueue Langchain agent streaming chunks in a separate thread to not block event chunks.
-        executor_stream_thread = threading.Thread(target=stream_worker, daemon=True, args=(ctx.dump(),))
+        executor_stream_thread = threading.Thread(
+            target=stream_worker, daemon=True, args=(ctx.dump(),), name='LangchainAgent.stream_worker'
+        )
         executor_stream_thread.start()
 
         while not agent_executor_finished_event.is_set():

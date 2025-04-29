@@ -178,7 +178,11 @@ class TestSelect(BaseExecutorDummyML):
         # second table is called with filter
         calls = data_handler().query.call_args_list
         sql = calls[0][0][0].to_string()
-        assert sql.strip() == 'SELECT * FROM tbl2 AS t2 WHERE c IN (2, 1)'
+        assert sql.strip() in (
+            # duckdb's `distinct` can return in different order
+            'SELECT * FROM tbl2 AS t2 WHERE c IN (1, 2)'
+            'SELECT * FROM tbl2 AS t2 WHERE c IN (2, 1)'
+        )
 
         # --- using alias in order
         ret = self.run_sql('''
@@ -292,9 +296,11 @@ class TestSelect(BaseExecutorDummyML):
         ret = self.run_sql(sql)
         assert len(ret) == 3
 
-        assert list(ret.iloc[0]) == [21, 3]
-        assert list(ret.iloc[1]) == [1, 1]
-        assert list(ret.iloc[2]) == [2, 2]
+        # union doesn't guarantee order
+        ret.sort_values(by='a', inplace=True)
+        assert list(ret.iloc[0]) == [1, 1]
+        assert list(ret.iloc[1]) == [2, 2]
+        assert list(ret.iloc[2]) == [21, 3]
 
         # -- aggregating / grouping / cases --
         case = '''

@@ -9,10 +9,10 @@ import secrets
 import traceback
 import threading
 from enum import Enum
-from packaging import version
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, List
 
+from packaging import version
 from sqlalchemy.orm.attributes import flag_modified
 
 from mindsdb.utilities import log
@@ -22,16 +22,18 @@ logger.debug("Starting MindsDB...")
 
 from mindsdb.__about__ import __version__ as mindsdb_version
 from mindsdb.utilities.config import config
+from mindsdb.utilities.exception import EntityNotExistsError
 from mindsdb.utilities.starters import (
-    start_http, start_mysql, start_mongo, start_postgres, start_ml_task_queue, start_scheduler, start_tasks
+    start_http, start_mysql, start_mongo, start_postgres, start_ml_task_queue, start_scheduler, start_tasks,
+    start_mcp, start_litellm
 )
 from mindsdb.utilities.ps import is_pid_listen_port, get_child_pids
 from mindsdb.utilities.functions import get_versions_where_predictors_become_obsolete
 from mindsdb.interfaces.database.integrations import integration_controller
+from mindsdb.interfaces.database.projects import ProjectController
 import mindsdb.interfaces.storage.db as db
 from mindsdb.integrations.utilities.install import install_dependencies
 from mindsdb.utilities.fs import clean_process_marks, clean_unlinked_process_marks
-from mindsdb.utilities.telemetry import telemetry_file_exists, disable_telemetry
 from mindsdb.utilities.context import context as ctx
 from mindsdb.utilities.auth import register_oauth_client, get_aws_meta_data
 from mindsdb.utilities.sentry import sentry_sdk  # noqa: F401
@@ -45,7 +47,6 @@ try:
 except RuntimeError:
     logger.info('Torch multiprocessing context already set, ignoring...')
 
-
 _stop_event = threading.Event()
 
 
@@ -57,6 +58,8 @@ class TrunkProcessEnum(Enum):
     JOBS = 'jobs'
     TASKS = 'tasks'
     ML_TASK_QUEUE = 'ml_task_queue'
+    MCP = 'mcp'
+    LITELLM = 'litellm'
 
     @classmethod
     def _missing_(cls, value):
@@ -221,9 +224,9 @@ if __name__ == '__main__':
     ctx.set_default()
 
     # ---- CHECK SYSTEM ----
-    if not (sys.version_info[0] >= 3 and sys.version_info[1] >= 9):
+    if not (sys.version_info[0] >= 3 and sys.version_info[1] >= 10):
         print("""
-     MindsDB requires Python >= 3.9 to run
+     MindsDB requires Python >= 3.10 to run
 
      Once you have supported Python version installed you can start mindsdb as follows:
 
@@ -247,15 +250,6 @@ if __name__ == '__main__':
 
     config.raise_warnings(logger=logger)
     os.environ["MINDSDB_RUNTIME"] = "1"
-
-    if telemetry_file_exists(config.paths['root']):
-        os.environ['CHECK_FOR_UPDATES'] = '0'
-        logger.info('\n x telemetry disabled! \n')
-    elif os.getenv('CHECK_FOR_UPDATES', '1').lower() in ['0', 'false', 'False'] or config.is_cloud:
-        disable_telemetry(config.paths['root'])
-        logger.info('\n x telemetry disabled! \n')
-    else:
-        logger.info("✓ telemetry enabled")
 
     if os.environ.get("FLASK_SECRET_KEY") is None:
         os.environ["FLASK_SECRET_KEY"] = secrets.token_hex(32)
@@ -302,6 +296,42 @@ if __name__ == '__main__':
             migrate.migrate_to_head()
         except Exception as e:
             logger.error(f"Error! Something went wrong during DB migrations: {e}")
+
+        logger.debug(f"Checking if default project {config.get('default_project')} exists")
+        project_controller = ProjectController()
+
+        try:
+            current_default_project = project_controller.get(is_default=True)
+        except EntityNotExistsError:
+            # In previous versions, the default project could be deleted. This is no longer possible.
+            current_default_project = None
+
+        if current_default_project:
+            if current_default_project.record.name != config.get('default_project'):
+                try:
+                    project_controller.get(name=config.get('default_project'))
+                    log.critical(f"A project with the name '{config.get('default_project')}' already exists")
+                    sys.exit(1)
+                except EntityNotExistsError:
+                    pass
+                project_controller.update(current_default_project.record.id, new_name=config.get('default_project'))
+
+        # Legacy: If the default project does not exist, mark the new one as default.
+        else:
+            try:
+                project_controller.get(name=config.get('default_project'))
+            except EntityNotExistsError:
+                log.critical(
+                    f"A project with the name '{config.get('default_project')}' does not exist"
+                )
+                raise
+
+            project_controller.update(
+                name=config.get('default_project'),
+                new_metadata={
+                    "is_default": True
+                }
+            )
 
     apis = os.getenv('MINDSDB_APIS') or config.cmd_args.api
 
@@ -379,8 +409,11 @@ if __name__ == '__main__':
 
     clean_process_marks()
 
-    http_api_config = config['api']['http']
-    mysql_api_config = config['api']['mysql']
+    # Get config values for APIs
+    http_api_config = config.get('api', {}).get('http', {})
+    mysql_api_config = config.get('api', {}).get('mysql', {})
+    mcp_api_config = config.get('api', {}).get('mcp', {})
+    litellm_api_config = config.get('api', {}).get('litellm', {})
     trunc_processes_struct = {
         TrunkProcessEnum.HTTP: TrunkProcessData(
             name=TrunkProcessEnum.HTTP.value,
@@ -430,11 +463,36 @@ if __name__ == '__main__':
             name=TrunkProcessEnum.ML_TASK_QUEUE.value,
             entrypoint=start_ml_task_queue,
             args=(config.cmd_args.verbose,)
+        ),
+        TrunkProcessEnum.MCP: TrunkProcessData(
+            name=TrunkProcessEnum.MCP.value,
+            entrypoint=start_mcp,
+            port=mcp_api_config.get('port', 47337),
+            args=(config.cmd_args.verbose,),
+            restart_on_failure=mcp_api_config.get('restart_on_failure', False),
+            max_restart_count=mcp_api_config.get('max_restart_count', TrunkProcessData.max_restart_count),
+            max_restart_interval_seconds=mcp_api_config.get(
+                'max_restart_interval_seconds', TrunkProcessData.max_restart_interval_seconds
+            )
+        ),
+        TrunkProcessEnum.LITELLM: TrunkProcessData(
+            name=TrunkProcessEnum.LITELLM.value,
+            entrypoint=start_litellm,
+            port=litellm_api_config.get('port', 8000),
+            args=(config.cmd_args.verbose,),
+            restart_on_failure=litellm_api_config.get('restart_on_failure', False),
+            max_restart_count=litellm_api_config.get('max_restart_count', TrunkProcessData.max_restart_count),
+            max_restart_interval_seconds=litellm_api_config.get(
+                'max_restart_interval_seconds', TrunkProcessData.max_restart_interval_seconds
+            )
         )
     }
 
     for api_enum in api_arr:
-        trunc_processes_struct[api_enum].need_to_run = True
+        if api_enum in trunc_processes_struct:
+            trunc_processes_struct[api_enum].need_to_run = True
+        else:
+            logger.error(f"ERROR: {api_enum} API is not a valid api in config")
 
     if config['jobs']['disable'] is False:
         trunc_processes_struct[TrunkProcessEnum.JOBS].need_to_run = True
@@ -548,7 +606,7 @@ if __name__ == '__main__':
     ioloop = asyncio.new_event_loop()
     ioloop.run_until_complete(wait_apis_start())
 
-    threading.Thread(target=do_clean_process_marks).start()
+    threading.Thread(target=do_clean_process_marks, name='clean_process_marks').start()
 
     ioloop.run_until_complete(gather_apis())
     ioloop.close()
