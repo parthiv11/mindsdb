@@ -16,8 +16,24 @@ JWT_ALGORITHM = 'HS256'
 
 def get_jwt_secret():
     config = Config()
-    # Assume secret stored under auth.jwt_secret, fallback to something default if not set
     return config['auth'].get('jwt_secret', 'default_jwt_secret_change_me')
+
+def create_token(username, token_type='access'):
+    now = int(time.time())
+    if token_type == 'access':
+        exp = now + 3600  # 1 hour
+    elif token_type == 'refresh':
+        exp = now + 7*24*3600  # 7 days
+    else:
+        raise ValueError('Invalid token type')
+
+    payload = {
+        'username': username,
+        'type': token_type,
+        'iat': now,
+        'exp': exp
+    }
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
 
 def check_auth() -> bool:
     config = Config()
@@ -47,7 +63,7 @@ def check_auth() -> bool:
 
             return True
 
-    # fallback to old session check if no bearer token
+    # fallback to old session check
     if config['auth'].get('provider') == 'cloud':
         if isinstance(session.get('username'), str) is False:
             return False
@@ -58,7 +74,6 @@ def check_auth() -> bool:
         return True
 
     return session.get('username') == config['auth']['username']
-
 
 @ns_conf.route('/login', methods=['POST'])
 class LoginRoute(Resource):
@@ -75,7 +90,7 @@ class LoginRoute(Resource):
     )
     @api_endpoint_metrics('POST', '/default/login')
     def post(self):
-        ''' Check user's credentials and creates a session or returns JWT token
+        ''' Check user's credentials and creates a session or returns JWT tokens
         '''
         username = request.json.get('username')
         password = request.json.get('password')
@@ -98,22 +113,56 @@ class LoginRoute(Resource):
                 'Invalid username or password'
             )
 
-        # Create JWT token
-        payload = {
-            'username': username,
-            'type': 'access',
-            'iat': int(time.time()),
-            'exp': int(time.time()) + 3600  # token expires in 1 hour
-        }
-        token = jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+        access_token = create_token(username, 'access')
+        refresh_token = create_token(username, 'refresh')
 
-        # Also keep old session behavior for compatibility
+        # Keep old session behavior for compatibility
         session.clear()
         session['username'] = username
         session.permanent = True
 
-        return {'access_token': token}, 200
+        return {
+            'access_token': access_token,
+            'refresh_token': refresh_token
+        }, 200
 
+@ns_conf.route('/refresh', methods=['POST'])
+class RefreshRoute(Resource):
+    @ns_conf.doc(
+        responses={
+            200: 'Success',
+            401: 'Invalid or expired refresh token',
+            400: 'Bad request'
+        },
+        body=ns_conf.model('request_refresh', {
+            'refresh_token': fields.String(description='Refresh token')
+        })
+    )
+    @api_endpoint_metrics('POST', '/default/refresh')
+    def post(self):
+        ''' Exchange a refresh token for a new access token
+        '''
+        refresh_token = request.json.get('refresh_token')
+        if not isinstance(refresh_token, str) or len(refresh_token) == 0:
+            return http_error(400, 'Bad request', 'Refresh token is required')
+
+        try:
+            payload = jwt.decode(refresh_token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        except jwt.ExpiredSignatureError:
+            return http_error(401, 'Unauthorized', 'Refresh token expired')
+        except jwt.InvalidTokenError:
+            return http_error(401, 'Unauthorized', 'Invalid refresh token')
+
+        if payload.get('type') != 'refresh':
+            return http_error(401, 'Unauthorized', 'Invalid token type')
+
+        username = payload.get('username')
+        config = Config()
+        if username != config['auth']['username']:
+            return http_error(401, 'Unauthorized', 'Invalid token username')
+
+        new_access_token = create_token(username, 'access')
+        return {'access_token': new_access_token}, 200
 
 @ns_conf.route('/logout', methods=['POST'])
 class LogoutRoute(Resource):
@@ -126,7 +175,6 @@ class LogoutRoute(Resource):
     def post(self):
         session.clear()
         return '', 200
-
 
 @ns_conf.route('/status')
 class StatusRoute(Resource):
@@ -148,8 +196,6 @@ class StatusRoute(Resource):
     )
     @api_endpoint_metrics('GET', '/default/status')
     def get(self):
-        ''' returns auth and environment data
-        '''
         environment = 'local'
         config = Config()
 
