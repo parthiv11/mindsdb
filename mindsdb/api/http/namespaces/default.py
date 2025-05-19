@@ -1,8 +1,8 @@
 import time
+import jwt
 
 from flask import request, session
-from flask_restx import Resource
-from flask_restx import fields
+from flask_restx import Resource, fields
 
 from mindsdb.__about__ import __version__ as mindsdb_version
 from mindsdb.api.http.namespaces.configs.default import ns_conf
@@ -11,30 +11,75 @@ from mindsdb.metrics.metrics import api_endpoint_metrics
 from mindsdb.utilities.config import Config
 from mindsdb.utilities import log
 
-
 logger = log.getLogger(__name__)
+
+JWT_ALGORITHM = 'HS256'
+ACCESS_TOKEN_EXP_SECONDS = 3600  # 1 hour
+REFRESH_TOKEN_EXP_SECONDS = 7 * 24 * 3600  # 7 days
+
+
+def get_jwt_secret() -> str:
+    config = Config()
+    # fallback secret, replace with your own or require config to provide it
+    return config['auth'].get('jwt_secret', 'fallback-secret-key')
+
+
+def create_access_token(username: str) -> str:
+    payload = {
+        'username': username,
+        'type': 'access',
+        'exp': time.time() + ACCESS_TOKEN_EXP_SECONDS
+    }
+    token = jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+    if isinstance(token, bytes):
+        token = token.decode('utf-8')
+    return token
+
+
+def create_refresh_token(username: str) -> str:
+    payload = {
+        'username': username,
+        'type': 'refresh',
+        'exp': time.time() + REFRESH_TOKEN_EXP_SECONDS
+    }
+    token = jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+    if isinstance(token, bytes):
+        token = token.decode('utf-8')
+    return token
 
 
 def check_auth() -> bool:
-    ''' checking whether current user is authenticated
-
-        Returns:
-            bool: True if user authentication is approved
-    '''
     config = Config()
     if config['auth']['http_auth_enabled'] is False:
         return True
 
-    if config['auth'].get('provider') == 'cloud':
-        if isinstance(session.get('username'), str) is False:
-            return False
+    auth_header = request.headers.get('Authorization')
+    if not auth_header:
+        return False
 
-        if config['auth']['oauth']['tokens']['expires_at'] < time.time():
-            return False
+    parts = auth_header.split()
+    if len(parts) != 2 or parts[0].lower() != 'bearer':
+        return False
 
-        return True
+    token = parts[1]
 
-    return session.get('username') == config['auth']['username']
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        logger.warning("Token expired")
+        return False
+    except jwt.InvalidTokenError:
+        logger.warning("Invalid token")
+        return False
+
+    if payload.get('type') != 'access':
+        return False
+
+    username = payload.get('username')
+    if username != config['auth']['username']:
+        return False
+
+    return True
 
 
 @ns_conf.route('/login', methods=['POST'])
@@ -52,13 +97,13 @@ class LoginRoute(Resource):
     )
     @api_endpoint_metrics('POST', '/default/login')
     def post(self):
-        ''' Check user's credentials and creates a session
+        ''' Check user's credentials and return JWT tokens
         '''
         username = request.json.get('username')
         password = request.json.get('password')
         if (
-            isinstance(username, str) is False or len(username) == 0
-            or isinstance(password, str) is False or len(password) == 0
+            not isinstance(username, str) or len(username) == 0
+            or not isinstance(password, str) or len(password) == 0
         ):
             return http_error(
                 400, 'Error in username or password',
@@ -69,20 +114,24 @@ class LoginRoute(Resource):
         inline_username = config['auth']['username']
         inline_password = config['auth']['password']
 
-        if (
-            username != inline_username
-            or password != inline_password
-        ):
+        if username != inline_username or password != inline_password:
             return http_error(
                 401, 'Forbidden',
                 'Invalid username or password'
             )
 
-        session.clear()
-        session['username'] = username
-        session.permanent = True
+        # Create JWT tokens
+        access_token = create_access_token(username)
+        refresh_token = create_refresh_token(username)
 
-        return '', 200
+        session.clear()  # you can still clear session if you want
+
+        return {
+            'access_token': access_token,
+            'refresh_token': refresh_token,
+            'token_type': 'bearer',
+            'expires_in': ACCESS_TOKEN_EXP_SECONDS
+        }, 200
 
 
 @ns_conf.route('/logout', methods=['POST'])
@@ -110,8 +159,8 @@ class StatusRoute(Resource):
             'auth': fields.Nested(
                 ns_conf.model('response_status_auth', {
                     'confirmed': fields.Boolean(description='is current user authenticated'),
-                    'required': fields.Boolean(description='is authenticated required'),
-                    'provider': fields.Boolean(description='current authenticated provider: local of 3d-party')
+                    'http_auth_enabled': fields.Boolean(description='is authenticated required'),
+                    'provider': fields.String(description='current authenticated provider: local or 3d-party')
                 })
             )
         })
